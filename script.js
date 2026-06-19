@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         GeoDuels UX Enhancement Plugin
-// @icon         https://icons.duckduckgo.com/ip3/geoduels.io.ico
+// @icon         [icons.duckduckgo.com](https://icons.duckduckgo.com/ip3/geoduels.io.ico)
 // @namespace    CSkUvkve7sr1zMhT
-// @description  Adds a GeoGuessr-style horizontal compass, shifts minimap, and moves forfeit action to a gear pause menu
-// @version      3.5
+// @description  Adds a GeoGuessr-style horizontal compass, shifts minimap, moves forfeit action to a gear pause menu safely, and adds a functional Undo + Checkpoint feature
+// @version      4.1
 // @match        *://*.geoduels.io/*
 // @match        *://*.googleusercontent.com/*
 // @match        *://*.google.com/*
@@ -14,10 +14,9 @@
 (function() {
     'use strict';
 
-    // --- 1. CROSS-FRAME INJECTION: Pins Zoom Layout & native compass neatly on the left ---
+    // --- 1. CROSS-FRAME INJECTION: Handles Zoom Layout & Parent Iframe Rules ---
     const frameStyle = document.createElement('style');
     frameStyle.textContent = `
-        /* 1. The main wrapper for BOTH compass and zoom */
         div.gmnoprint:has(> .gmnoprint[data-control-width="40"]) {
             position: fixed !important;
             left: 16px !important;
@@ -30,14 +29,12 @@
             z-index: 999999 !important;
             width: 48px !important;
             height: 140px !important;
-            pointer-events: none !important; /* Allow clicks to pass through empty spaces */
+            pointer-events: none !important;
         }
-
-        /* 2. The actual zoom control */
         .gmnoprint[data-control-width="40"] {
             position: absolute !important;
             left: 4px !important;
-            bottom: 0px !important; /* Stick to bottom of the 140px wrapper */
+            bottom: 0px !important;
             top: auto !important;
             right: auto !important;
             margin: 0 !important;
@@ -47,7 +44,6 @@
             background-color: rgba(26, 26, 36, 0.85) !important;
             border-radius: 11px !important;
             backdrop-filter: blur(8px) !important;
-            -webkit-backdrop-filter: blur(8px) !important;
             box-shadow: 0 4px 12px rgba(0,0,0,0.3) !important;
         }
         .gmnoprint[data-control-width="40"] button {
@@ -55,11 +51,9 @@
             pointer-events: auto !important;
             cursor: pointer !important;
         }
-
-        /* 3. The Compass Container */
         div.gmnoprint:has(> .gmnoprint[data-control-width="40"]) > div:has(> .gm-compass) {
             position: absolute !important;
-            top: 0px !important; /* Stick to top of the 140px wrapper */
+            top: 0px !important;
             bottom: auto !important;
             left: 0px !important;
             right: auto !important;
@@ -70,7 +64,6 @@
     `;
     (document.head || document.documentElement).appendChild(frameStyle);
 
-    // Backup Enforcer: Prevents Google Maps from snapping the wrapper back to left: 0
     if (window.top !== window.self) {
         setInterval(() => {
             const zoomControl = document.querySelector('.gmnoprint[data-control-width="40"]');
@@ -78,16 +71,31 @@
                 zoomControl.parentElement.style.setProperty('margin', '0', 'important');
                 zoomControl.parentElement.style.setProperty('left', '16px', 'important');
                 zoomControl.parentElement.style.setProperty('bottom', '81px', 'important');
-                zoomControl.parentElement.style.setProperty('top', 'auto', 'important');
             }
         }, 500);
     }
 
-    // --- 2. GLOBAL HOOK: Intercept Google Maps API Engine for Top Compass ---
+    // --- 2. GLOBAL HOOK: Intercept Engine & Track Position History ---
     const hookScript = document.createElement('script');
     hookScript.textContent = `
         (function(){
             let hooked = false;
+            let svInstance = null;
+            let movementHistory = [];
+            let checkpointPosition = null;
+            let blockNextRecord = false;
+
+            function getCurrentLatLng() {
+                const pos = svInstance && svInstance.getPosition ? svInstance.getPosition() : null;
+                if (!pos) return null;
+                return { lat: pos.lat(), lng: pos.lng() };
+            }
+
+            function samePos(a, b) {
+                if (!a || !b) return false;
+                return Math.abs(a.lat - b.lat) < 0.0000001 && Math.abs(a.lng - b.lng) < 0.0000001;
+            }
+
             function applyHook() {
                 if (hooked || !window.google || !window.google.maps || !window.google.maps.StreetViewPanorama) return;
 
@@ -95,21 +103,93 @@
                 window.google.maps.StreetViewPanorama = new Proxy(OriginalSV, {
                     construct(target, args) {
                         const instance = new target(...args);
+                        svInstance = instance;
+                        movementHistory = [];
+                        checkpointPosition = null;
 
-                        // Broadcast orientation updates back to our compass script handler
                         instance.addListener('pov_changed', () => {
-                            window.top.postMessage({type: 'GEO_COMPASS_UPDATE', heading: instance.getPov().heading}, '*');
+                            window.top.postMessage({ type: 'GEO_COMPASS_UPDATE', heading: instance.getPov().heading }, '*');
+                        });
+
+                        instance.addListener('position_changed', () => {
+                            if (blockNextRecord) {
+                                blockNextRecord = false;
+                                return;
+                            }
+
+                            const currentPos = getCurrentLatLng();
+                            if (!currentPos) return;
+
+                            const last = movementHistory[movementHistory.length - 1];
+                            if (!last || !samePos(last, currentPos)) {
+                                movementHistory.push(currentPos);
+                            }
                         });
 
                         setTimeout(() => {
-                            window.top.postMessage({type: 'GEO_COMPASS_UPDATE', heading: instance.getPov().heading}, '*');
-                        }, 500);
+                            window.top.postMessage({ type: 'GEO_COMPASS_UPDATE', heading: instance.getPov().heading }, '*');
+                            const currentPos = getCurrentLatLng();
+                            if (currentPos) {
+                                movementHistory = [currentPos];
+                                checkpointPosition = currentPos;
+                            }
+                        }, 600);
 
                         return instance;
                     }
                 });
                 hooked = true;
             }
+
+            window.addEventListener('message', (e) => {
+                if (!e.data || !svInstance) return;
+
+                if (e.data.type === 'GEO_EXECUTE_UNDO') {
+                    if (movementHistory.length > 1) {
+                        movementHistory.pop();
+                        const targetPos = movementHistory[movementHistory.length - 1];
+                        if (targetPos) {
+                            blockNextRecord = true;
+                            svInstance.setPosition(targetPos);
+                        }
+                    }
+                } else if (e.data.type === 'GEO_SET_CHECKPOINT') {
+                    const currentPos = getCurrentLatLng();
+                    if (currentPos) {
+                        checkpointPosition = currentPos;
+                        movementHistory = [currentPos];
+                    }
+                } else if (e.data.type === 'GEO_RESET_TO_CHECKPOINT') {
+                    if (checkpointPosition) {
+                        blockNextRecord = true;
+                        svInstance.setPosition(checkpointPosition);
+                        movementHistory = [checkpointPosition];
+                    }
+                } else if (e.data.type === 'GEO_TELEPORT_AND_CLEAR') {
+                    if (checkpointPosition) {
+                        blockNextRecord = true;
+                        svInstance.setPosition(checkpointPosition);
+                        movementHistory = [checkpointPosition];
+                        checkpointPosition = null;
+                    }
+                } else if (e.data.type === 'GEO_RELAY_KEYDOWN') {
+                    const key = e.data.key;
+                    if (key === 'z') {
+                        if (movementHistory.length > 1) {
+                            movementHistory.pop();
+                            const targetPos = movementHistory[movementHistory.length - 1];
+                            if (targetPos) { blockNextRecord = true; svInstance.setPosition(targetPos); }
+                        }
+                    } else if (key === 'x' || key === 'c') {
+                        window.top.postMessage({ type: 'GEO_KEY_CHECKPOINT_TOGGLE' }, '*');
+                    }
+                } else if (e.data.type === 'GEO_RESET_HISTORY') {
+                    const currentPos = getCurrentLatLng();
+                    movementHistory = currentPos ? [currentPos] : [];
+                    checkpointPosition = currentPos || null;
+                }
+            });
+
             let interval = setInterval(applyHook, 10);
             setTimeout(() => clearInterval(interval), 10000);
         })();
@@ -213,6 +293,137 @@
         window.addEventListener('click', unlockAutoplay);
         window.addEventListener('keydown', unlockAutoplay);
 
+        function postToAllFrames(message) {
+            const frames = document.querySelectorAll('iframe');
+            frames.forEach(frame => {
+                try {
+                    frame.contentWindow.postMessage(message, '*');
+                } catch (_) {}
+            });
+        }
+
+        function triggerUndoAction() {
+            postToAllFrames({ type: 'GEO_EXECUTE_UNDO' });
+        }
+
+        function triggerSetCheckpoint() {
+            postToAllFrames({ type: 'GEO_SET_CHECKPOINT' });
+        }
+
+        function triggerTeleportAndClear() {
+            postToAllFrames({ type: 'GEO_TELEPORT_AND_CLEAR' });
+        }
+
+        function triggerResetToCheckpoint() {
+            postToAllFrames({ type: 'GEO_RESET_TO_CHECKPOINT' });
+        }
+
+        function broadcastHistoryWipe() {
+            postToAllFrames({ type: 'GEO_RESET_HISTORY' });
+        }
+
+        // Inject a keydown relay listener into Street View iframes so keypresses
+        // while the map has focus still reach our handler via postMessage
+        const injectedFrames = new WeakSet();
+        function injectKeyRelayIntoFrames() {
+            document.querySelectorAll('iframe').forEach(frame => {
+                if (injectedFrames.has(frame)) return;
+                try {
+                    const doc = frame.contentDocument || frame.contentWindow?.document;
+                    if (!doc || !doc.body) return;
+                    const relay = doc.createElement('script');
+                    relay.textContent = `
+                        (function() {
+                            if (window.__gdKeyRelayInjected) return;
+                            window.__gdKeyRelayInjected = true;
+                            window.addEventListener('keydown', function(e) {
+                                var tag = document.activeElement && document.activeElement.tagName;
+                                if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+                                var key = e.key ? e.key.toLowerCase() : '';
+                                if (key === 'z' || key === 'x' || key === 'c') {
+                                    window.top.postMessage({ type: 'GEO_RELAY_KEYDOWN', key: key }, '*');
+                                }
+                            }, true);
+                        })();
+                    `;
+                    (doc.head || doc.documentElement).appendChild(relay);
+                    injectedFrames.add(frame);
+                } catch (_) {}
+            });
+        }
+
+        // checkpointActive tracks whether a checkpoint is currently set (green state)
+        let checkpointActive = false;
+
+        function setCheckpointGreen() {
+            checkpointActive = true;
+            const cpBtn = document.getElementById('gd-checkpoint-btn');
+            if (cpBtn) {
+                cpBtn.style.setProperty('background', 'rgba(34, 211, 133, 0.25)', 'important');
+                cpBtn.style.setProperty('color', '#22d385', 'important');
+                cpBtn.style.setProperty('border', '1.5px solid rgba(34, 211, 133, 0.6)', 'important');
+                cpBtn.title = 'Return to checkpoint (X / C). Click again to teleport back.';
+            }
+        }
+
+        function clearCheckpointGreen() {
+            checkpointActive = false;
+            const cpBtn = document.getElementById('gd-checkpoint-btn');
+            if (cpBtn) {
+                cpBtn.style.removeProperty('background');
+                cpBtn.style.removeProperty('color');
+                cpBtn.style.removeProperty('border');
+                cpBtn.title = 'Set checkpoint (X). Click again to return.';
+            }
+        }
+
+        function handleCheckpointToggle() {
+            if (!checkpointActive) {
+                triggerSetCheckpoint();
+                setCheckpointGreen();
+            } else {
+                triggerTeleportAndClear();
+                clearCheckpointGreen();
+            }
+        }
+
+        // Top-window keydown (fires when page UI has focus)
+        window.addEventListener('keydown', (e) => {
+            if (!insideMatchUrl) return;
+            if (
+                document.activeElement &&
+                (
+                    document.activeElement.tagName === 'INPUT' ||
+                    document.activeElement.tagName === 'TEXTAREA' ||
+                    document.activeElement.isContentEditable
+                )
+            ) return;
+
+            const key = e.key.toLowerCase();
+            if (key === 'z') {
+                triggerUndoAction();
+            } else if (key === 'x' || key === 'c') {
+                handleCheckpointToggle();
+            }
+        });
+
+        // Message listener: handles compass updates AND relayed keypresses from iframes
+        window.addEventListener('message', (e) => {
+            if (!e.data) return;
+            if (e.data.type === 'GEO_COMPASS_UPDATE' && typeof e.data.heading === 'number') {
+                targetHeading = e.data.heading;
+            } else if (e.data.type === 'GEO_KEY_CHECKPOINT_TOGGLE' && insideMatchUrl) {
+                handleCheckpointToggle();
+            } else if (e.data.type === 'GEO_RELAY_KEYDOWN' && insideMatchUrl) {
+                const key = e.data.key;
+                if (key === 'z') {
+                    triggerUndoAction();
+                } else if (key === 'x' || key === 'c') {
+                    handleCheckpointToggle();
+                }
+            }
+        });
+
         // --- UI Layer: Compass ---
         const compassContainer = document.createElement('div');
         compassContainer.id = 'gg-horizontal-compass-container';
@@ -272,36 +483,61 @@
         // --- HUD Styling Custom Sheet ---
         const style = document.createElement('style');
         style.textContent = `
-            /* Fixes the invisible HUD columns swallowing background clicks */
-            .flex.items-center.gap-2:has(#gd-gear-pause-btn) {
-                flex-direction: row !important;
-                align-items: flex-end !important;
-                position: fixed !important;
-                left: 14px !important;
-                bottom: 14px !important;
-                gap: 8px !important;
+            button[aria-label="Forfeit match"] {
+                position: absolute !important;
+                opacity: 0 !important;
                 pointer-events: none !important;
+                width: 0 !important;
+                height: 0 !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                border: none !important;
+                overflow: hidden !important;
             }
-            .flex.items-center.gap-2:has(#gd-gear-pause-btn) > * {
+
+            div:has(> button[aria-label="Forfeit match"]) {
+                position: fixed !important;
+                left: 66px !important;
+                bottom: 14px !important;
+                top: auto !important;
+                right: auto !important;
+                transform: none !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                z-index: 999999 !important;
+                display: flex !important;
+                align-items: center !important;
+                justify-content: center !important;
+                width: 44px !important;
+                height: 44px !important;
                 pointer-events: auto !important;
             }
 
-            .gd-left-hud-col, .gd-right-hud-col {
-                display: flex !important;
-                flex-direction: column-reverse !important;
-                gap: 8px !important;
-                align-items: center !important;
-                pointer-events: none !important;
+            #gd-gear-pause-btn {
+                position: fixed !important;
+                left: 14px !important;
+                bottom: 14px !important;
+                z-index: 1000000 !important;
             }
-            .gd-left-hud-col > *, .gd-right-hud-col > * {
-                pointer-events: auto !important;
+
+            #gd-checkpoint-btn {
+                position: fixed !important;
+                left: 66px !important;
+                bottom: 66px !important;
+                z-index: 1000000 !important;
+            }
+
+            #gd-undo-move-btn {
+                position: fixed !important;
+                left: 66px !important;
+                bottom: 118px !important;
+                z-index: 1000000 !important;
             }
 
             .animate-hudSlideIn {
                 transition: top 0.2s cubic-bezier(0.4, 0, 0.2, 1) !important;
             }
 
-            /* Compass Styling */
             #gg-horizontal-compass-container {
                 position: fixed;
                 top: 12px;
@@ -355,13 +591,11 @@
                 box-shadow: 0 0 4px rgba(0,0,0,0.8);
             }
 
-            /* Pause Modal Layout */
             #gd-pause-modal {
                 position: fixed;
                 inset: 0;
                 background: rgba(10, 10, 15, 0.65);
                 backdrop-filter: blur(6px);
-                -webkit-backdrop-filter: blur(6px);
                 z-index: 1000000;
                 display: flex;
                 align-items: center;
@@ -424,9 +658,6 @@
                 background: rgba(239, 68, 68, 0.3);
                 color: #ffffff;
             }
-            #gd-gear-pause-btn ~ div {
-                display: none !important;
-            }
         `;
         document.head.appendChild(style);
 
@@ -434,11 +665,11 @@
         const points = [
             { name: 'N', deg: 0 },   { name: '|', deg: 15 },  { name: '|', deg: 30 },
             { name: 'NE', deg: 45 }, { name: '|', deg: 60 },  { name: '|', deg: 75 },
-            { name: 'E', deg: 90 },   { name: '|', deg: 105 }, { name: '|', deg: 120 },
+            { name: 'E', deg: 90 },  { name: '|', deg: 105 }, { name: '|', deg: 120 },
             { name: 'SE', deg: 135 }, { name: '|', deg: 150 }, { name: '|', deg: 165 },
-            { name: 'S', deg: 180 },  { name: '|', deg: 195 }, { name: '|', deg: 210 },
+            { name: 'S', deg: 180 }, { name: '|', deg: 195 }, { name: '|', deg: 210 },
             { name: 'SW', deg: 225 }, { name: '|', deg: 240 }, { name: '|', deg: 255 },
-            { name: 'W', deg: 270 },  { name: '|', deg: 285 }, { name: '|', deg: 300 },
+            { name: 'W', deg: 270 }, { name: '|', deg: 285 }, { name: '|', deg: 300 },
             { name: 'NW', deg: 315 }, { name: '|', deg: 330 }, { name: '|', deg: 345 }
         ];
 
@@ -510,25 +741,19 @@
 
         document.getElementById('gd-confirm-cancel-btn').addEventListener('click', () => {
             confirmOverlay.style.display = 'none';
-            const nativeGearBtn = document.getElementById('gd-gear-pause-btn');
-            if (nativeGearBtn && nativeGearBtn.parentElement) {
-                const nativeCancelBtn = Array.from(nativeGearBtn.parentElement.querySelectorAll('button'))
-                    .find(btn => btn.textContent.trim() === 'Keep Playing' || btn.getAttribute('aria-label') === 'Cancel forfeit');
-                if (nativeCancelBtn) nativeCancelBtn.click();
-            }
+            const nativeCancelBtn = Array.from(document.querySelectorAll('button'))
+                .find(btn => btn.textContent.trim() === 'Keep Playing' || btn.getAttribute('aria-label') === 'Cancel forfeit' || btn.textContent.includes('Cancel'));
+            if (nativeCancelBtn) nativeCancelBtn.click();
         });
 
         document.getElementById('gd-confirm-accept-btn').addEventListener('click', () => {
-            const nativeGearBtn = document.getElementById('gd-gear-pause-btn');
-            if (nativeGearBtn && nativeGearBtn.parentElement) {
-                const nativeButtons = Array.from(nativeGearBtn.parentElement.querySelectorAll('button'));
-                const genuineConfirmBtn = nativeButtons.find(btn => btn.textContent.trim() === 'Confirm');
+            const genuineConfirmBtn = Array.from(document.querySelectorAll('button'))
+                .find(btn => btn.textContent.trim() === 'Confirm' || btn.textContent.includes('Forfeit') || btn.textContent.includes('Yes'));
 
-                if (genuineConfirmBtn) {
-                    confirmOverlay.style.display = 'none';
-                    pauseModal.style.display = 'none';
-                    genuineConfirmBtn.click();
-                }
+            if (genuineConfirmBtn) {
+                confirmOverlay.style.display = 'none';
+                pauseModal.style.display = 'none';
+                genuineConfirmBtn.click();
             }
         });
 
@@ -537,22 +762,22 @@
         let currentHeading = 0;
         let activeTargetButton = null;
 
-        window.addEventListener('message', (e) => {
-            if (e.data?.type === 'GEO_COMPASS_UPDATE' && typeof e.data.heading === 'number') {
-                targetHeading = e.data.heading;
-            }
-        });
-
         function liveFrameWorker() {
             tickCounter++;
+
             if (window.location.href.includes('/match/')) {
                 if (!insideMatchUrl) {
                     insideMatchUrl = true;
                     currentRoundNum = 0;
                     playTrack(0);
+                    broadcastHistoryWipe();
                 }
 
-                // Push Minimap tightly into the corner (runs slightly throttled to save CPU)
+                // Inject keydown relay into Street View iframes so hotkeys work while map has focus
+                if (tickCounter % 60 === 0) {
+                    injectKeyRelayIntoFrames();
+                }
+
                 if (tickCounter % 30 === 0) {
                     const placePinBtns = document.querySelectorAll('button');
                     for (let i = 0; i < placePinBtns.length; i++) {
@@ -576,6 +801,8 @@
                         if (parsedRound !== currentRoundNum) {
                             currentRoundNum = parsedRound;
                             playTrack(currentRoundNum);
+                            broadcastHistoryWipe();
+                            clearCheckpointGreen();
                         }
                     }
                 }
@@ -600,6 +827,7 @@
                     } else {
                         currentHeading += diff * 0.25;
                     }
+
                     currentHeading = (currentHeading + 360) % 360;
 
                     const translationX = (CONTAINER_WIDTH / 2) - (currentHeading * PIXELS_PER_DEGREE);
@@ -608,36 +836,10 @@
                     compassContainer.style.display = 'none';
                 }
 
-                // Dynamic Action Layout Substitution Assembly
                 const nativeForfeit = document.querySelector('button[aria-label="Forfeit match"]');
-                if (nativeForfeit && nativeForfeit.style.opacity !== '0') {
+                if (nativeForfeit) {
                     activeTargetButton = nativeForfeit;
 
-                    nativeForfeit.style.setProperty('position', 'absolute', 'important');
-                    nativeForfeit.style.setProperty('opacity', '0', 'important');
-                    nativeForfeit.style.setProperty('pointer-events', 'none', 'important');
-                    nativeForfeit.style.setProperty('width', '0', 'important');
-                    nativeForfeit.style.setProperty('height', '0', 'important');
-
-                    const parentContainer = nativeForfeit.parentNode;
-
-                    let leftCol = document.getElementById('gd-hud-left-column');
-                    let rightCol = document.getElementById('gd-hud-right-column');
-
-                    if (!leftCol) {
-                        leftCol = document.createElement('div');
-                        leftCol.id = 'gd-hud-left-column';
-                        leftCol.className = 'gd-left-hud-col';
-                        parentContainer.appendChild(leftCol);
-                    }
-                    if (!rightCol) {
-                        rightCol = document.createElement('div');
-                        rightCol.id = 'gd-hud-right-column';
-                        rightCol.className = 'gd-right-hud-col';
-                        parentContainer.appendChild(rightCol);
-                    }
-
-                    // Left Column Setup: Gear button
                     if (!document.getElementById('gd-gear-pause-btn')) {
                         const gearBtn = document.createElement('button');
                         gearBtn.id = 'gd-gear-pause-btn';
@@ -653,19 +855,14 @@
                         gearBtn.addEventListener('click', () => {
                             pauseModal.style.display = 'flex';
                         });
-                        leftCol.appendChild(gearBtn);
-                    }
-
-                    // Right Column Setup: Flag -> Checkpoint -> Undo Stack
-                    const flagBtn = parentContainer.querySelector('button[aria-label="Return to spawn location"]');
-                    if (flagBtn && flagBtn.parentNode !== rightCol) {
-                        rightCol.appendChild(flagBtn);
+                        document.body.appendChild(gearBtn);
                     }
 
                     if (!document.getElementById('gd-checkpoint-btn')) {
                         const checkpointBtn = document.createElement('button');
                         checkpointBtn.id = 'gd-checkpoint-btn';
                         checkpointBtn.type = 'button';
+                        checkpointBtn.title = 'Set checkpoint (X). Click again to return.';
                         checkpointBtn.className = "flex h-11 w-11 items-center justify-center rounded-full bg-hudBg text-white/80 shadow-elev-2 backdrop-blur-hud transition hover:bg-white/10 hover:text-white";
                         checkpointBtn.innerHTML = `
                             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
@@ -673,7 +870,8 @@
                                 <circle cx="12" cy="10" r="3"/>
                             </svg>
                         `;
-                        rightCol.appendChild(checkpointBtn);
+                        checkpointBtn.addEventListener('click', handleCheckpointToggle);
+                        document.body.appendChild(checkpointBtn);
                     }
 
                     if (!document.getElementById('gd-undo-move-btn')) {
@@ -687,7 +885,8 @@
                                 <path d="M4 9h10.5a5.5 5.5 0 0 1 5.5 5.5v0a5.5 5.5 0 0 1-5.5 5.5H11"/>
                             </svg>
                         `;
-                        rightCol.appendChild(undoBtn);
+                        undoBtn.addEventListener('click', triggerUndoAction);
+                        document.body.appendChild(undoBtn);
                     }
                 }
             } else {
@@ -703,22 +902,18 @@
                 const currentCheckpoint = document.getElementById('gd-checkpoint-btn');
                 if (currentCheckpoint) currentCheckpoint.remove();
 
-                const leftCol = document.getElementById('gd-hud-left-column');
-                if (leftCol) leftCol.remove();
-
-                const rightCol = document.getElementById('gd-hud-right-column');
-                if (rightCol) rightCol.remove();
-
                 activeTargetButton = null;
 
                 if (insideMatchUrl) {
                     insideMatchUrl = false;
+                    clearCheckpointGreen();
                     stopAllMusic();
                 }
             }
 
             requestAnimationFrame(liveFrameWorker);
         }
+
         requestAnimationFrame(liveFrameWorker);
     }
 })();
