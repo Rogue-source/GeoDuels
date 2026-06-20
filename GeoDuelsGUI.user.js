@@ -4,6 +4,8 @@
 // @namespace    CSkUvkve7sr1zMhT
 // @description  Adds a GeoGuessr-style GUI to geoduels!
 // @version      1.0
+// @updateURL    https://raw.githubusercontent.com/Rogue-source/GeoDuels/main/GeoDuelsGUI.user.js
+// @downloadURL  https://raw.githubusercontent.com/Rogue-source/GeoDuels/main/GeoDuelsGUI.user.js
 // @match        *://*.geoduels.io/*
 // @match        *://*.googleusercontent.com/*
 // @match        *://*.google.com/*
